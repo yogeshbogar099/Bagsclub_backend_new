@@ -2444,7 +2444,7 @@ async function buildSuperAdminDashboardStats() {
     detailsPath: `/dashboard/super-admin/wallet-management/details/${request._id.toString()}`
   }));
 
-  const recentWalletDebitsRows = recentWalletDebits.map((order) => ({
+  const recentWalletDebitsRows = recentWalletDebitOrders.map((order) => ({
     id: `wallet-debit-${order._id.toString()}`,
     reference: order.referenceNo || `ORD-${String(order.orderNumber || "").trim() || order._id.toString().slice(-6).toUpperCase()}`,
     type: "Debit",
@@ -6864,7 +6864,7 @@ async function buildAdminModuleBootstrap(adminId) {
     recentUsers,
     recentOrders,
     recentWalletRequests,
-    recentWalletDebits,
+    recentWalletDebitOrders,
     pendingMembers,
     pendingOrderItems,
     pendingWalletRequests
