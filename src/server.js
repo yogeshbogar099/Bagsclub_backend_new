@@ -154,6 +154,7 @@ const orderSchema = new mongoose.Schema(
     assignedAssociateMemberId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     assignedAdminId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     referenceNo: { type: String, trim: true, default: "" },
+    invoiceNumber: { type: String, trim: true, default: "", index: true },
     basePayableAmount: { type: Number, default: 0 },
     pdfDiscountAmount: { type: Number, default: 0 },
     walletDebitAmount: { type: Number, default: 0 },
@@ -252,7 +253,7 @@ function authenticate(req, res, next) {
     req.auth = jwt.verify(token, jwtSecret);
 
     if (req.auth?.sub && req.auth.sub !== "super-admin" && mongoose.connection.readyState === 1) {
-      User.updateOne({ _id: req.auth.sub }, { $set: { lastActivityAt: new Date() } }).catch(() => {});
+      User.updateOne({ _id: req.auth.sub }, { $set: { lastActivityAt: new Date() } }).catch(() => { });
     }
 
     return next();
@@ -513,8 +514,8 @@ async function buildWalletRequestDetails(requestDocument) {
       ? requestDocument.requestedByUserId
       : requestDocument.requestedByUserId
         ? await User.findById(requestDocument.requestedByUserId).select(
-            "ownerName mobile email businessName address country state district city pinCode gstNumber role status createdAt"
-          )
+          "ownerName mobile email businessName address country state district city pinCode gstNumber role status createdAt"
+        )
         : null;
 
   const requesterName =
@@ -540,22 +541,22 @@ async function buildWalletRequestDetails(requestDocument) {
     requestedByExternalKey: String(requestDocument.requestedByExternalKey || "").trim(),
     requester: requester
       ? {
-          id: requester._id?.toString?.() || "",
-          name: requester.ownerName || "--",
-          mobileNumber: requester.mobile || "--",
-          email: requester.email || "--",
-          businessName: requester.businessName || "--",
-          address: requester.address || "--",
-          country: requester.country || "--",
-          state: requester.state || "--",
-          district: requester.district || "--",
-          city: requester.city || "--",
-          pinCode: requester.pinCode || "--",
-          gstNumber: requester.gstNumber || "--",
-          role: normalizeRoleLabel(requester.role || ""),
-          status: normalizeAdminStatusLabel(requester.status),
-          registrationDate: formatDateTime(requester.createdAt)
-        }
+        id: requester._id?.toString?.() || "",
+        name: requester.ownerName || "--",
+        mobileNumber: requester.mobile || "--",
+        email: requester.email || "--",
+        businessName: requester.businessName || "--",
+        address: requester.address || "--",
+        country: requester.country || "--",
+        state: requester.state || "--",
+        district: requester.district || "--",
+        city: requester.city || "--",
+        pinCode: requester.pinCode || "--",
+        gstNumber: requester.gstNumber || "--",
+        role: normalizeRoleLabel(requester.role || ""),
+        status: normalizeAdminStatusLabel(requester.status),
+        registrationDate: formatDateTime(requester.createdAt)
+      }
       : null
   };
 }
@@ -1114,6 +1115,42 @@ async function getNextOrderNumber() {
   return latestOrder.orderNumber + 5;
 }
 
+function formatYYYYMMDD(dateInput) {
+  const d = dateInput ? new Date(dateInput) : new Date();
+  if (Number.isNaN(d.getTime())) {
+    const now = new Date();
+    return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+  }
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}${month}${day}`;
+}
+
+async function generateNextInvoiceNumber(dateInput) {
+  const dateStr = formatYYYYMMDD(dateInput);
+  const prefix = `INV-${dateStr}-`;
+  const regex = new RegExp(`^${escapeRegex(prefix)}(\\d+)$`);
+  const existingOrders = await Order.find({ invoiceNumber: regex }).select("invoiceNumber").lean();
+
+  let maxSeq = 0;
+  for (const doc of existingOrders) {
+    if (doc.invoiceNumber) {
+      const match = doc.invoiceNumber.match(/^INV-\d{8}-(\d+)$/);
+      if (match && match[1]) {
+        const seq = parseInt(match[1], 10);
+        if (seq > maxSeq) {
+          maxSeq = seq;
+        }
+      }
+    }
+  }
+
+  const nextSeq = maxSeq + 1;
+  const seqStr = String(nextSeq).padStart(3, "0");
+  return `INV-${dateStr}-${seqStr}`;
+}
+
 async function ensureOrderNumbersForExistingOrders() {
   const missingOrders = await Order.find({
     $or: [{ orderNumber: null }, { orderNumber: { $exists: false } }]
@@ -1121,21 +1158,66 @@ async function ensureOrderNumbersForExistingOrders() {
     .sort({ createdAt: 1, _id: 1 })
     .select("_id");
 
-  if (missingOrders.length === 0) {
+  if (missingOrders.length > 0) {
+    let nextOrderNumber = await getNextOrderNumber();
+    const operations = missingOrders.map((order) => {
+      const operation = {
+        updateOne: {
+          filter: { _id: order._id },
+          update: { $set: { orderNumber: nextOrderNumber } }
+        }
+      };
+      nextOrderNumber += 5;
+      return operation;
+    });
+
+    if (operations.length > 0) {
+      await Order.bulkWrite(operations);
+    }
+  }
+
+  await ensureInvoiceNumbersForExistingOrders();
+}
+
+async function ensureInvoiceNumbersForExistingOrders() {
+  const unassignedOrders = await Order.find({
+    $or: [{ invoiceNumber: null }, { invoiceNumber: "" }, { invoiceNumber: { $exists: false } }]
+  }).sort({ orderedAt: 1, createdAt: 1, _id: 1 });
+
+  if (unassignedOrders.length === 0) {
     return;
   }
 
-  let nextOrderNumber = await getNextOrderNumber();
-  const operations = missingOrders.map((order) => {
-    const operation = {
-      updateOne: {
-        filter: { _id: order._id },
-        update: { $set: { orderNumber: nextOrderNumber } }
+  const dateCounters = {};
+  const allInvoicedOrders = await Order.find({
+    invoiceNumber: /^INV-\d{8}-\d+$/
+  }).select("invoiceNumber").lean();
+
+  for (const doc of allInvoicedOrders) {
+    const match = doc.invoiceNumber.match(/^INV-(\d{8})-(\d+)$/);
+    if (match) {
+      const dateStr = match[1];
+      const seq = parseInt(match[2], 10);
+      if (!dateCounters[dateStr] || seq > dateCounters[dateStr]) {
+        dateCounters[dateStr] = seq;
       }
-    };
-    nextOrderNumber += 5;
-    return operation;
-  });
+    }
+  }
+
+  const operations = [];
+  for (const orderDoc of unassignedOrders) {
+    const dateStr = formatYYYYMMDD(orderDoc.orderedAt || orderDoc.createdAt);
+    dateCounters[dateStr] = (dateCounters[dateStr] || 0) + 1;
+    const seqStr = String(dateCounters[dateStr]).padStart(3, "0");
+    const invNumber = `INV-${dateStr}-${seqStr}`;
+
+    operations.push({
+      updateOne: {
+        filter: { _id: orderDoc._id },
+        update: { $set: { invoiceNumber: invNumber } }
+      }
+    });
+  }
 
   if (operations.length > 0) {
     await Order.bulkWrite(operations);
@@ -1204,6 +1286,7 @@ async function buildOrderRow(orderDocument) {
   return {
     id: order._id.toString(),
     orderNumber: order.orderNumber,
+    invoiceNumber: order.invoiceNumber || "",
     orderName: order.orderName || order.referenceNo || `Order ${order.orderNumber || ""}`.trim(),
     orderDateTime: order.orderedAt || order.createdAt,
     orderDetailsOverview: order.orderDetailsOverview || order.referenceNo || "No overview available",
@@ -1243,45 +1326,45 @@ async function buildOrderRow(orderDocument) {
     pressline: order.pressline || "",
     placedByUser: placedByUser
       ? {
-          id: placedByUser._id?.toString?.() || "",
-          name: placedByUser.ownerName || "",
-          mobileNumber: placedByUser.mobile || "",
-          businessName: placedByUser.businessName || "",
-          email: placedByUser.email || "",
-          country: placedByUser.country || "",
-          state: placedByUser.state || "",
-          district: placedByUser.district || "",
-          city: placedByUser.city || "",
-          pinCode: placedByUser.pinCode || "",
-          address: placedByUser.address || "",
-          fullAddress: buildAddress(placedByUser),
-          gstNumber: placedByUser.gstNumber || "",
-          referenceCode: placedByUser.referenceCode || "",
-          registrationDate: placedByUser.createdAt || null,
-          role: placedByUser.role || "",
-          associateMemberId: getAssociateMemberDisplayId(placedByUser.mobile || ""),
-          status: normalizeAdminStatusLabel(placedByUser.status)
-        }
+        id: placedByUser._id?.toString?.() || "",
+        name: placedByUser.ownerName || "",
+        mobileNumber: placedByUser.mobile || "",
+        businessName: placedByUser.businessName || "",
+        email: placedByUser.email || "",
+        country: placedByUser.country || "",
+        state: placedByUser.state || "",
+        district: placedByUser.district || "",
+        city: placedByUser.city || "",
+        pinCode: placedByUser.pinCode || "",
+        address: placedByUser.address || "",
+        fullAddress: buildAddress(placedByUser),
+        gstNumber: placedByUser.gstNumber || "",
+        referenceCode: placedByUser.referenceCode || "",
+        registrationDate: placedByUser.createdAt || null,
+        role: placedByUser.role || "",
+        associateMemberId: getAssociateMemberDisplayId(placedByUser.mobile || ""),
+        status: normalizeAdminStatusLabel(placedByUser.status)
+      }
       : null,
     assignedAssociateMember: assignedAssociate
       ? {
-          id: assignedAssociate._id?.toString?.() || "",
-          name: assignedAssociate.ownerName || "",
-          mobileNumber: assignedAssociate.mobile || "",
-          businessName: assignedAssociate.businessName || "",
-          email: assignedAssociate.email || "",
-          status: normalizeAdminStatusLabel(assignedAssociate.status)
-        }
+        id: assignedAssociate._id?.toString?.() || "",
+        name: assignedAssociate.ownerName || "",
+        mobileNumber: assignedAssociate.mobile || "",
+        businessName: assignedAssociate.businessName || "",
+        email: assignedAssociate.email || "",
+        status: normalizeAdminStatusLabel(assignedAssociate.status)
+      }
       : null,
     assignedAdmin: assignedAdmin
       ? {
-          id: assignedAdmin._id?.toString?.() || "",
-          name: assignedAdmin.ownerName || "",
-          mobileNumber: assignedAdmin.mobile || "",
-          businessName: assignedAdmin.businessName || "",
-          email: assignedAdmin.email || "",
-          status: normalizeAdminStatusLabel(assignedAdmin.status)
-        }
+        id: assignedAdmin._id?.toString?.() || "",
+        name: assignedAdmin.ownerName || "",
+        mobileNumber: assignedAdmin.mobile || "",
+        businessName: assignedAdmin.businessName || "",
+        email: assignedAdmin.email || "",
+        status: normalizeAdminStatusLabel(assignedAdmin.status)
+      }
       : null,
     referenceNo: order.referenceNo || "",
     basePayableAmount: Number(order.basePayableAmount || 0),
@@ -1299,7 +1382,7 @@ async function buildOrderDetails(orderDocument) {
     .populate("assignedAssociateMemberId", "ownerName mobile email businessName status")
     .populate("assignedAdminId", "ownerName mobile email businessName status")
     .select(
-      "orderNumber orderName customerName customerMobile orderDetailsOverview bagName printSide quantity bagSize bagColor textColorType textColors printingPress privacy deliveryOption fileOption sellingPrice remark pressline orderedAt status designSubmissionSource designFileName designFileType designFileUrl courierName courierTrackingNumber courierTrackingUrl dispatchDateTime dispatchNotes deliveryStatus deliveryDateTime isUrgent referenceNo basePayableAmount pdfDiscountAmount walletDebitAmount placedByUserId assignedAssociateMemberId assignedAdminId statusHistory dispatchHistory createdAt updatedAt"
+      "orderNumber invoiceNumber orderName customerName customerMobile orderDetailsOverview bagName printSide quantity bagSize bagColor textColorType textColors printingPress privacy deliveryOption fileOption sellingPrice remark pressline orderedAt status designSubmissionSource designFileName designFileType designFileUrl courierName courierTrackingNumber courierTrackingUrl dispatchDateTime dispatchNotes deliveryStatus deliveryDateTime isUrgent referenceNo basePayableAmount pdfDiscountAmount walletDebitAmount placedByUserId assignedAssociateMemberId assignedAdminId statusHistory dispatchHistory createdAt updatedAt"
     );
 
   const baseRow = await buildOrderRow(populatedOrder);
@@ -1348,6 +1431,7 @@ async function fetchOrderList(queryParams = {}) {
     orderName = "",
     customerName = "",
     mobileNumber = "",
+    printingPress = "",
     status = "",
     designFileSource = "",
     fromDate = "",
@@ -1413,6 +1497,10 @@ async function fetchOrderList(queryParams = {}) {
     andFilters.push({ customerMobile: new RegExp(escapeRegex(String(mobileNumber).replace(/\D/g, ""))) });
   }
 
+  if (printingPress) {
+    andFilters.push({ printingPress: new RegExp(escapeRegex(String(printingPress).trim()), "i") });
+  }
+
   const normalizedOrderStatus = normalizeOrderStatusInput(status);
   if (normalizedOrderStatus) {
     query.status =
@@ -1474,6 +1562,7 @@ function mapAssociateSearchOrderRow(order) {
   return {
     id: order.id,
     orderNumber: order.orderNumber || "--",
+    invoiceNumber: order.invoiceNumber || "--",
     dateTime: formatDateTime(order.orderDateTime || order.createdAt),
     orderName: order.orderName || "--",
     orderDetail: buildRecentOrderSummary(order),
@@ -1512,6 +1601,7 @@ function mapRecentOrderRow(order) {
   return {
     id: order._id.toString(),
     orderNumber: order.orderNumber || "--",
+    invoiceNumber: order.invoiceNumber || "--",
     dateTime: formatDateTime(order.orderedAt || order.createdAt),
     orderName: order.orderName || "--",
     orderDetail: buildRecentOrderSummary(order),
@@ -1953,13 +2043,13 @@ async function buildAssociateMemberDetails(memberDocument) {
     assignedAdmin:
       populatedMember.assignedAdminId && typeof populatedMember.assignedAdminId === "object"
         ? {
-            id: populatedMember.assignedAdminId._id.toString(),
-            adminName: populatedMember.assignedAdminId.ownerName,
-            mobileNumber: populatedMember.assignedAdminId.mobile,
-            email: populatedMember.assignedAdminId.email,
-            businessName: populatedMember.assignedAdminId.businessName,
-            status: normalizeAdminStatusLabel(populatedMember.assignedAdminId.status)
-          }
+          id: populatedMember.assignedAdminId._id.toString(),
+          adminName: populatedMember.assignedAdminId.ownerName,
+          mobileNumber: populatedMember.assignedAdminId.mobile,
+          email: populatedMember.assignedAdminId.email,
+          businessName: populatedMember.assignedAdminId.businessName,
+          status: normalizeAdminStatusLabel(populatedMember.assignedAdminId.status)
+        }
         : null
   };
 }
@@ -3072,7 +3162,7 @@ app.get(
   async (req, res) => {
     const result = await fetchAssociateMemberList(req.query);
     // #region debug-point H3:associate-api-response
-    fetch("http://127.0.0.1:7777/event",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sessionId:"associate-table-api",runId:"pre",hypothesisId:"H3",location:"server.js:2318",msg:"[DEBUG] Associate Member API returning payload",data:{query:req.query,itemCount:Array.isArray(result?.items)?result.items.length:null,totalRecords:result?.pagination?.totalRecords??null,totalPages:result?.pagination?.totalPages??null,userRole:req.user?.role||null},ts:Date.now()})}).catch(()=>{});
+    fetch("http://127.0.0.1:7777/event", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: "associate-table-api", runId: "pre", hypothesisId: "H3", location: "server.js:2318", msg: "[DEBUG] Associate Member API returning payload", data: { query: req.query, itemCount: Array.isArray(result?.items) ? result.items.length : null, totalRecords: result?.pagination?.totalRecords ?? null, totalPages: result?.pagination?.totalPages ?? null, userRole: req.user?.role || null }, ts: Date.now() }) }).catch(() => { });
     // #endregion
     return res.json(result);
   }
@@ -6007,12 +6097,12 @@ async function buildAssociateMemberModuleBootstrap(memberId) {
     serviceCards: (associateMember.services || []).length
       ? associateMember.services.map(mapAssociateServiceCard)
       : [
-          {
-            title: "Printing Services",
-            description: "Submit new print jobs and manage order workflows from your dashboard.",
-            meta: "Default service"
-          }
-        ],
+        {
+          title: "Printing Services",
+          description: "Submit new print jobs and manage order workflows from your dashboard.",
+          meta: "Default service"
+        }
+      ],
     recentOrderColumns: [
       { key: "orderNumber", label: "Order No." },
       { key: "orderName", label: "Order Name" },
@@ -6043,7 +6133,7 @@ async function buildAssociateMemberSectionData(section, view, memberId) {
       .sort({ createdAt: -1, orderedAt: -1 })
       .limit(100)
       .select(
-        "orderNumber orderName customerName customerMobile status orderDetailsOverview bagName printSide quantity bagSize bagColor textColorType textColors printingPress privacy deliveryOption fileOption sellingPrice remark pressline referenceNo designSubmissionSource designFileName designFileType designFileUrl orderedAt basePayableAmount pdfDiscountAmount walletDebitAmount createdAt"
+        "orderNumber invoiceNumber orderName customerName customerMobile status orderDetailsOverview bagName printSide quantity bagSize bagColor textColorType textColors printingPress privacy deliveryOption fileOption sellingPrice remark pressline referenceNo designSubmissionSource designFileName designFileType designFileUrl orderedAt basePayableAmount pdfDiscountAmount walletDebitAmount createdAt"
       );
 
     return {
@@ -6065,6 +6155,7 @@ async function buildAssociateMemberSectionData(section, view, memberId) {
       items: orders.map((order) => ({
         id: order._id.toString(),
         orderNumber: order.orderNumber || "--",
+        invoiceNumber: order.invoiceNumber || "--",
         dateTime: formatDateTime(order.orderedAt || order.createdAt),
         orderName: order.orderName || "--",
         orderDetail: buildRecentOrderSummary(order),
@@ -6164,16 +6255,16 @@ async function buildAssociateMemberSectionData(section, view, memberId) {
       },
       items: associateMember
         ? [
-            { id: "name", field: "Your Name", value: associateMember.ownerName },
-            { id: "business", field: "Business / Firm", value: associateMember.businessName },
-            { id: "mobile", field: "WhatsApp Number", value: associateMember.mobile },
-            { id: "email", field: "Email Address", value: associateMember.email },
-            { id: "country", field: "Country", value: associateMember.country },
-            { id: "state", field: "State", value: associateMember.state },
-            { id: "district", field: "District", value: associateMember.district },
-            { id: "address", field: "Full Address", value: buildAddress(associateMember) },
-            { id: "access", field: "Associate Access", value: associateMember.associateMemberAccessEnabled ? "Enabled" : "Disabled" }
-          ]
+          { id: "name", field: "Your Name", value: associateMember.ownerName },
+          { id: "business", field: "Business / Firm", value: associateMember.businessName },
+          { id: "mobile", field: "WhatsApp Number", value: associateMember.mobile },
+          { id: "email", field: "Email Address", value: associateMember.email },
+          { id: "country", field: "Country", value: associateMember.country },
+          { id: "state", field: "State", value: associateMember.state },
+          { id: "district", field: "District", value: associateMember.district },
+          { id: "address", field: "Full Address", value: buildAddress(associateMember) },
+          { id: "access", field: "Associate Access", value: associateMember.associateMemberAccessEnabled ? "Enabled" : "Disabled" }
+        ]
         : []
     };
   }
@@ -6205,25 +6296,40 @@ app.get("/api/associate-member-module/orders/search", authenticate, requireRole(
   const status = String(req.query.status || "").trim();
   const fromDate = String(req.query.fromDate || "").trim();
   const toDate = String(req.query.toDate || "").trim();
+  const customerName = String(req.query.customerName || "").trim();
+  const orderName = String(req.query.orderName || req.query.product || "").trim();
+  const printingPress = String(req.query.printingPress || "").trim();
 
   const queryPayload = {
     placedByUserId: req.auth.sub,
-    limit: 100,
+    limit: 200,
     sortBy: "orderedAt",
     sortOrder: "desc"
   };
 
-  if (searchType === "order-number") {
+  if (searchType === "order-number" && orderNumber) {
     queryPayload.orderNumber = orderNumber;
   }
 
-  if (searchType === "order-stage") {
+  if (searchType === "order-stage" && status) {
     queryPayload.status = status;
   }
 
   if (searchType === "order-date") {
     queryPayload.fromDate = fromDate;
     queryPayload.toDate = toDate || fromDate;
+  }
+
+  if (customerName) {
+    queryPayload.customerName = customerName;
+  }
+
+  if (orderName) {
+    queryPayload.orderName = orderName;
+  }
+
+  if (printingPress) {
+    queryPayload.printingPress = printingPress;
   }
 
   const result = await fetchOrderList(queryPayload);
@@ -6350,7 +6456,7 @@ async function createManualOrderForRole(req, res, role) {
     return res.status(400).json({ message: "Invalid design submission source." });
   }
 
-  if (!bagName || !printSide || !Number.isFinite(quantity) || quantity <= 0 || !bagSize || !bagColor || !textColorType || !textColors.length || !printingPress || !privacy || !deliveryOption || !fileOption || !Number.isFinite(sellingPrice) || sellingPrice <= 0 || !pressline) {
+  if (!bagName || !printSide || !Number.isFinite(quantity) || quantity <= 0 || !bagSize || !bagColor || !textColorType || !textColors.length || !privacy || !deliveryOption || !fileOption || !Number.isFinite(sellingPrice) || sellingPrice <= 0 || !pressline) {
     return res.status(400).json({ message: "Complete order details are required." });
   }
 
@@ -6366,9 +6472,11 @@ async function createManualOrderForRole(req, res, role) {
   await ensureOrderNumbersForExistingOrders();
   const maxOrder = await Order.findOne({}).sort({ orderNumber: -1 }).select("orderNumber");
   const nextOrderNumber = Math.max(Number(maxOrder?.orderNumber || 1000) + 1, 1001);
+  const invoiceNumber = await generateNextInvoiceNumber(new Date());
 
   const order = await Order.create({
     orderNumber: nextOrderNumber,
+    invoiceNumber,
     orderName,
     customerName,
     customerMobile,
@@ -6535,6 +6643,366 @@ app.post("/api/associate-member-module/wallet/top-up", authenticate, requireRole
 app.get("/api/associate-member-module/wallet/history", authenticate, requireRole(ROLE_ASSOCIATE_MEMBER), ensureDatabaseConnected, async (req, res) => {
   return res.json(await buildWalletHistoryForActor({ userId: req.auth.sub, role: ROLE_ASSOCIATE_MEMBER }));
 });
+
+const reportMonthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const reportUpperMonthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+function formatAccountStatementDateTime(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "--";
+
+  const pad = (n) => String(n).padStart(2, "0");
+  const day = pad(date.getDate());
+  const month = pad(date.getMonth() + 1);
+  const year = date.getFullYear();
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+
+  return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
+}
+
+function formatReportMonthDayYear(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${reportMonthNames[date.getMonth()]}-${pad(date.getDate())}-${date.getFullYear()}`;
+}
+
+async function getAssociateAccountTransactionsReport(userId, { fromDate, toDate } = {}) {
+  const normalizedUserId =
+    typeof userId === "string" && mongoose.isValidObjectId(userId) ? new mongoose.Types.ObjectId(userId) : userId;
+
+  const user = await User.findById(normalizedUserId).select("businessName ownerName mobile email referenceCode");
+  const userName = user?.ownerName || user?.businessName || "User";
+  const companyName = user?.businessName || user?.ownerName || userName;
+
+  const now = new Date();
+  let startDate = null;
+  let endDate = null;
+
+  if (fromDate) {
+    startDate = new Date(fromDate);
+    if (Number.isNaN(startDate.getTime())) {
+      const parts = String(fromDate).split("-");
+      if (parts.length === 3) {
+        const mIndex = reportMonthNames.findIndex((m) => m.toLowerCase() === parts[0].toLowerCase());
+        if (mIndex >= 0) {
+          startDate = new Date(Number(parts[2]), mIndex, Number(parts[1]));
+        }
+      }
+    }
+  }
+  if (!startDate || Number.isNaN(startDate.getTime())) {
+    startDate = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+  } else {
+    startDate.setHours(0, 0, 0, 0);
+  }
+
+  if (toDate) {
+    endDate = new Date(toDate);
+    if (Number.isNaN(endDate.getTime())) {
+      const parts = String(toDate).split("-");
+      if (parts.length === 3) {
+        const mIndex = reportMonthNames.findIndex((m) => m.toLowerCase() === parts[0].toLowerCase());
+        if (mIndex >= 0) {
+          endDate = new Date(Number(parts[2]), mIndex, Number(parts[1]));
+        }
+      }
+    }
+  }
+  if (!endDate || Number.isNaN(endDate.getTime())) {
+    endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+  } else {
+    endDate.setHours(23, 59, 59, 999);
+  }
+
+  const m1 = reportUpperMonthNames[startDate.getMonth()];
+  const y1 = startDate.getFullYear();
+  const m2 = reportUpperMonthNames[endDate.getMonth()];
+  const y2 = endDate.getFullYear();
+
+  let statementTitle = `ACCOUNT STATEMENT - ${m1}-${y1}`;
+  if (m1 !== m2 || y1 !== y2) {
+    if (y1 === y2) {
+      statementTitle = `ACCOUNT STATEMENT - ${m1}-${m2} ${y1}`;
+    } else {
+      statementTitle = `ACCOUNT STATEMENT - ${m1}-${y1} - ${m2}-${y2}`;
+    }
+  }
+
+  const [topUpRequests, orders] = await Promise.all([
+    TopUpRequest.find({
+      requestedByUserId: normalizedUserId,
+      status: "approved"
+    }).lean(),
+    Order.find({
+      $or: [
+        { placedByUserId: normalizedUserId },
+        { assignedAssociateMemberId: normalizedUserId }
+      ]
+    }).lean()
+  ]);
+
+  const allTransactions = [];
+
+  for (const req of topUpRequests) {
+    const amount = Number(req.amount || 0);
+    if (amount <= 0) continue;
+
+    const date = new Date(req.createdAt || req.updatedAt || Date.now());
+    let desc = "Wallet Top-Up Approved";
+    if (req.remarks) {
+      desc = `Auto (Ref. No. ${req._id.toString().slice(-12)}, ${req.remarks})`;
+    } else {
+      desc = `Auto (Ref. No. ${req._id.toString().slice(-12)})`;
+    }
+
+    allTransactions.push({
+      id: `topup-${req._id.toString()}`,
+      type: "credit",
+      amount,
+      date,
+      description: desc,
+      orderId: null,
+      orderNumber: null,
+      reference: req._id.toString()
+    });
+  }
+
+  for (const ord of orders) {
+    const debitAmount = Number(ord.walletDebitAmount || ord.basePayableAmount || ord.sellingPrice || 0);
+    if (debitAmount <= 0) continue;
+
+    const orderDate = new Date(ord.orderedAt || ord.createdAt || Date.now());
+    const orderNum = ord.orderNumber || ord.referenceNo || ord._id.toString().slice(-6);
+
+    allTransactions.push({
+      id: `order-debit-${ord._id.toString()}`,
+      type: "debit",
+      amount: debitAmount,
+      date: orderDate,
+      description: `Order Placed - ${orderNum}`,
+      orderId: ord._id.toString(),
+      orderNumber: ord.orderNumber || null,
+      reference: ord.referenceNo || String(ord.orderNumber || "")
+    });
+
+    const status = String(ord.status || "").toLowerCase();
+    if (status === "cancelled" || status === "rejected") {
+      let cancelDate = new Date(ord.updatedAt || ord.createdAt || Date.now());
+      if (Array.isArray(ord.statusHistory)) {
+        const cancelHistory = ord.statusHistory.find(
+          (h) => h.status === "cancelled" || h.status === "rejected"
+        );
+        if (cancelHistory?.changedAt) {
+          cancelDate = new Date(cancelHistory.changedAt);
+        }
+      }
+
+      allTransactions.push({
+        id: `order-refund-${ord._id.toString()}`,
+        type: "credit",
+        amount: debitAmount,
+        date: cancelDate,
+        description: `Refund against Cancelled Order No ${orderNum}`,
+        orderId: ord._id.toString(),
+        orderNumber: ord.orderNumber || null,
+        reference: ord.referenceNo || String(ord.orderNumber || "")
+      });
+    }
+  }
+
+  let openingBalance = 0;
+  let periodCredited = 0;
+  let periodDebited = 0;
+  const periodTransactions = [];
+
+  const startMs = startDate.getTime();
+  const endMs = endDate.getTime();
+
+  for (const tx of allTransactions) {
+    const txMs = tx.date.getTime();
+    if (txMs < startMs) {
+      if (tx.type === "credit") {
+        openingBalance += tx.amount;
+      } else if (tx.type === "debit") {
+        openingBalance -= tx.amount;
+      }
+    } else if (txMs <= endMs) {
+      if (tx.type === "credit") {
+        periodCredited += tx.amount;
+      } else if (tx.type === "debit") {
+        periodDebited += tx.amount;
+      }
+      periodTransactions.push(tx);
+    }
+  }
+
+  periodTransactions.sort((a, b) => b.date.getTime() - a.date.getTime());
+
+  const closingBalance = openingBalance + periodCredited - periodDebited;
+
+  const formattedTransactions = periodTransactions.map((tx) => ({
+    id: tx.id,
+    date: tx.date.toISOString(),
+    formattedDate: formatAccountStatementDateTime(tx.date),
+    description: tx.description,
+    type: tx.type,
+    credit: tx.type === "credit" ? tx.amount.toFixed(2) : "",
+    debit: tx.type === "debit" ? tx.amount.toFixed(2) : "",
+    amount: tx.amount.toFixed(2),
+    orderId: tx.orderId,
+    orderNumber: tx.orderNumber,
+    reference: tx.reference
+  }));
+
+  return {
+    statementTitle,
+    userName,
+    companyName,
+    fromDate: startDate.toISOString().split("T")[0],
+    toDate: endDate.toISOString().split("T")[0],
+    formattedFromDate: formatReportMonthDayYear(startDate),
+    formattedToDate: formatReportMonthDayYear(endDate),
+    summary: {
+      openingBalance: Number(openingBalance.toFixed(2)),
+      openingBalanceFormatted: openingBalance.toFixed(2),
+      credited: Number(periodCredited.toFixed(2)),
+      creditedFormatted: periodCredited.toFixed(2),
+      debited: Number(periodDebited.toFixed(2)),
+      debitedFormatted: periodDebited.toFixed(2),
+      closingBalance: Number(closingBalance.toFixed(2)),
+      closingBalanceFormatted: closingBalance.toFixed(2)
+    },
+    transactions: formattedTransactions
+  };
+}
+
+app.get(
+  ["/api/associate-member-module/reports/account-transactions", "/api/associate-member/reports/account-transactions"],
+  authenticate,
+  requireRole(ROLE_ASSOCIATE_MEMBER),
+  ensureDatabaseConnected,
+  async (req, res) => {
+    try {
+      const report = await getAssociateAccountTransactionsReport(req.auth.sub, req.query);
+      return res.json(report);
+    } catch (err) {
+      console.error("Account transactions report error:", err);
+      return res.status(500).json({ message: "Failed to generate account transaction report." });
+    }
+  }
+);
+
+async function getAssociateInvoiceReport(userId, { month, year } = {}) {
+  const normalizedUserId =
+    typeof userId === "string" && mongoose.isValidObjectId(userId) ? new mongoose.Types.ObjectId(userId) : userId;
+
+  const now = new Date();
+  const targetYear = parseInt(year, 10) || now.getFullYear();
+  const targetMonth = parseInt(month, 10) ? parseInt(month, 10) - 1 : now.getMonth();
+
+  const startDate = new Date(targetYear, targetMonth, 1, 0, 0, 0, 0);
+  const endDate = new Date(targetYear, targetMonth + 1, 0, 23, 59, 59, 999);
+
+  const orders = await Order.find({
+    $or: [
+      { placedByUserId: normalizedUserId },
+      { assignedAssociateMemberId: normalizedUserId }
+    ],
+    createdAt: { $gte: startDate, $lte: endDate }
+  })
+    .populate("placedByUserId", "businessName ownerName state")
+    .sort({ createdAt: -1 })
+    .lean();
+
+  let totalTaxable = 0;
+  let totalCgst = 0;
+  let totalSgst = 0;
+  let totalIgst = 0;
+  let totalAmount = 0;
+
+  const invoices = orders.map((ord) => {
+    const total = Number(ord.walletDebitAmount || ord.basePayableAmount || ord.sellingPrice || 1226.02);
+    const taxable = Number((total / 1.18).toFixed(2));
+    const totalTax = Number((total - taxable).toFixed(2));
+
+    const stateStr = String(ord.placedByUserId?.state || "MAHARASHTRA").trim();
+    const isInterstate = stateStr.toLowerCase() !== "rajasthan";
+
+    let cgst = 0;
+    let sgst = 0;
+    let igst = 0;
+
+    if (isInterstate) {
+      igst = totalTax;
+    } else {
+      cgst = Number((totalTax / 2).toFixed(2));
+      sgst = Number((totalTax / 2).toFixed(2));
+    }
+
+    totalTaxable += taxable;
+    totalCgst += cgst;
+    totalSgst += sgst;
+    totalIgst += igst;
+    totalAmount += total;
+
+    const dateObj = new Date(ord.orderedAt || ord.createdAt || Date.now());
+    const dateStr = formatDateTime(dateObj);
+
+    const invNo = ord.invoiceNumber && ord.invoiceNumber !== "--"
+      ? ord.invoiceNumber
+      : `INV-${dateObj.getFullYear()}${String(dateObj.getMonth() + 1).padStart(2, "0")}${String(dateObj.getDate()).padStart(2, "0")}-${String(ord.orderNumber % 1000 || 1).padStart(3, "0")}`;
+
+    return {
+      orderId: ord._id.toString(),
+      orderNumber: ord.orderNumber,
+      invoiceNo: invNo,
+      invoiceDate: dateStr,
+      supplier: "Bagsclub of India Limited",
+      supplierGst: "08ABACS2502D1ZX",
+      gstScheme: "Regular",
+      taxableAmount: taxable.toFixed(2),
+      taxRate: "18.00%",
+      cgstAmount: cgst.toFixed(2),
+      sgstAmount: sgst.toFixed(2),
+      igstAmount: igst.toFixed(2),
+      totalAmount: total.toFixed(2)
+    };
+  });
+
+  const reportUpperMonthNames = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"];
+
+  return {
+    month: targetMonth + 1,
+    year: targetYear,
+    periodLabel: `${reportUpperMonthNames[targetMonth]} ${targetYear}`,
+    summary: {
+      totalTaxableFormatted: totalTaxable.toFixed(2),
+      totalCgstFormatted: totalCgst.toFixed(2),
+      totalSgstFormatted: totalSgst.toFixed(2),
+      totalIgstFormatted: totalIgst.toFixed(2),
+      totalAmountFormatted: totalAmount.toFixed(2)
+    },
+    invoices
+  };
+}
+
+app.get(
+  ["/api/associate-member-module/reports/invoice", "/api/associate-member/reports/invoice"],
+  authenticate,
+  requireRole(ROLE_ASSOCIATE_MEMBER),
+  ensureDatabaseConnected,
+  async (req, res) => {
+    try {
+      const report = await getAssociateInvoiceReport(req.auth.sub, req.query);
+      return res.json(report);
+    } catch (err) {
+      console.error("Invoice report error:", err);
+      return res.status(500).json({ message: "Failed to generate invoice report." });
+    }
+  }
+);
 
 app.get("/api/admin-module/wallet/history", authenticate, requireRole(ROLE_ADMIN), ensureDatabaseConnected, async (req, res) => {
   return res.json(await buildWalletHistoryForActor({ userId: req.auth.sub, role: ROLE_ADMIN }));
@@ -7176,8 +7644,8 @@ async function buildAdminModuleSectionData(section, view, adminId) {
           String(order.designSubmissionSource || "").toLowerCase() === DESIGN_SOURCE_EMAIL
             ? "Email"
             : String(order.designFileType || (order.designFileName?.includes(".") ? order.designFileName.split(".").pop() : "File"))
-                .trim()
-                .toUpperCase() || "File",
+              .trim()
+              .toUpperCase() || "File",
         hasEmailDesign: String(order.designSubmissionSource || "").toLowerCase() === DESIGN_SOURCE_EMAIL
       }))
     };
@@ -7300,15 +7768,15 @@ async function buildAdminModuleSectionData(section, view, adminId) {
       },
       items: admin
         ? [
-            { id: "name", field: "Admin Name", value: admin.ownerName },
-            { id: "business", field: "Business / Firm", value: admin.businessName },
-            { id: "mobile", field: "WhatsApp Number", value: admin.mobile },
-            { id: "email", field: "Email Address", value: admin.email },
-            { id: "country", field: "Country", value: admin.country },
-            { id: "state", field: "State", value: admin.state },
-            { id: "district", field: "District", value: admin.district },
-            { id: "address", field: "Full Address", value: buildAddress(admin) }
-          ]
+          { id: "name", field: "Admin Name", value: admin.ownerName },
+          { id: "business", field: "Business / Firm", value: admin.businessName },
+          { id: "mobile", field: "WhatsApp Number", value: admin.mobile },
+          { id: "email", field: "Email Address", value: admin.email },
+          { id: "country", field: "Country", value: admin.country },
+          { id: "state", field: "State", value: admin.state },
+          { id: "district", field: "District", value: admin.district },
+          { id: "address", field: "Full Address", value: buildAddress(admin) }
+        ]
         : []
     };
   }
