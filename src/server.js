@@ -150,7 +150,7 @@ const orderSchema = new mongoose.Schema(
     deliveryStatus: { type: String, trim: true, default: "" },
     deliveryDateTime: { type: Date, default: null },
     isUrgent: { type: Boolean, default: false, index: true },
-    placedByUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    placedByUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     assignedAssociateMemberId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     assignedAdminId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     referenceNo: { type: String, trim: true, default: "" },
@@ -189,7 +189,7 @@ const orderSchema = new mongoose.Schema(
 const topUpRequestSchema = new mongoose.Schema(
   {
     status: { type: String, default: "pending", index: true },
-    requestedByUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    requestedByUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     requestedByExternalKey: { type: String, trim: true, default: "", index: true },
     requestedByRole: { type: String, trim: true, default: "" },
     requestedByDisplayName: { type: String, trim: true, default: "" },
@@ -203,6 +203,8 @@ const topUpRequestSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+topUpRequestSchema.index({ requestedByUserId: 1, status: 1 });
 
 const auditLogSchema = new mongoose.Schema(
   {
@@ -2277,11 +2279,6 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(403).json({ message: "Your account has been suspended. Please contact support." });
     }
 
-    await User.updateOne(
-      { _id: user._id },
-      { $set: { lastLoginAt: new Date(), lastActivityAt: new Date() } }
-    );
-
     const token = createToken({
       sub: user._id.toString(),
       country: user.country,
@@ -2289,7 +2286,13 @@ app.post("/api/auth/login", async (req, res) => {
       role: user.role
     });
 
-    const walletBalance = await getWalletBalanceForActor({ userId: user._id, role: user.role });
+    const [_, walletBalance] = await Promise.all([
+      User.updateOne(
+        { _id: user._id },
+        { $set: { lastLoginAt: new Date(), lastActivityAt: new Date() } }
+      ),
+      getWalletBalanceForActor({ userId: user._id, role: user.role })
+    ]);
 
     return res.json({
       message: "Login successful.",
@@ -7514,16 +7517,16 @@ async function buildAdminModuleBootstrap(adminId) {
       termsLink: "Terms_And_Conditions.aspx?type=new"
     },
     dashboardCards: [
-      { title: "Total Users", value: totalUsers, note: "Your admin account plus assigned associate members.", iconKey: "associate-members" },
-      { title: "Total Associate Members", value: totalMembers, note: "Associate members currently mapped to this admin.", iconKey: "associate-members" },
-      { title: "Total Orders", value: totalOrders, note: "Orders currently within this admin scope.", iconKey: "orders" },
-      { title: "Pending Orders", value: pendingOrders, note: "Orders waiting for review or production.", iconKey: "orders" },
-      { title: "Printing Orders", value: printingOrders, note: "Orders currently in printing.", iconKey: "orders" },
-      { title: "Packaging Orders", value: packagingOrders, note: "Orders currently in packaging.", iconKey: "orders" },
-      { title: "Dispatch Orders", value: dispatchOrders, note: "Orders currently in dispatch.", iconKey: "orders" },
-      { title: "Completed Orders", value: completedOrders, note: "Orders completed under this admin.", iconKey: "orders" },
-      { title: "Total Wallet Transactions", value: totalWalletTransactions, note: "Top-up credits and order debits in your scope.", iconKey: "wallet" },
-      { title: "Pending Wallet Requests", value: pendingTopUps, note: "Wallet requests waiting for review.", iconKey: "wallet" }
+      { title: "Total Users", value: totalUsers, note: "Your admin account plus assigned associate members.", iconKey: "associate-members", path: "/dashboard/admin/associate-members/all" },
+      { title: "Total Associate Members", value: totalMembers, note: "Associate members currently mapped to this admin.", iconKey: "associate-members", path: "/dashboard/admin/associate-members/all" },
+      { title: "Total Orders", value: totalOrders, note: "Orders currently within this admin scope.", iconKey: "orders", path: "/dashboard/admin/orders/all" },
+      { title: "Pending Orders", value: pendingOrders, note: "Orders waiting for review or production.", iconKey: "orders", path: "/dashboard/admin/orders/pending" },
+      { title: "Printing Orders", value: printingOrders, note: "Orders currently in printing.", iconKey: "orders", path: "/dashboard/admin/orders/printing" },
+      { title: "Packaging Orders", value: packagingOrders, note: "Orders currently in packaging.", iconKey: "orders", path: "/dashboard/admin/orders/packaging" },
+      { title: "Dispatch Orders", value: dispatchOrders, note: "Orders currently in dispatch.", iconKey: "orders", path: "/dashboard/admin/orders/dispatch" },
+      { title: "Completed Orders", value: completedOrders, note: "Orders completed under this admin.", iconKey: "orders", path: "/dashboard/admin/orders/completed" },
+      { title: "Total Wallet Transactions", value: totalWalletTransactions, note: "Top-up credits and order debits in your scope.", iconKey: "wallet", path: "/dashboard/admin/wallet/transactions" },
+      { title: "Pending Wallet Requests", value: pendingTopUps, note: "Wallet requests waiting for review.", iconKey: "wallet", path: "/dashboard/admin/wallet/top-up-requests" }
     ],
     dashboardOverview: {
       totalUsers,
